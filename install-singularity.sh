@@ -44,13 +44,13 @@ echo ""
 # ------------------------------- live dependencies ---------------------------
 # Packages the live session needs before any disk work. Installed up front.
 LIVE_PKGS=(
-    artix-keyring curl iputils parted dosfstools xfsprogs lvm2 chrony
+    artix-keyring curl iputils parted dosfstools xfsprogs lvm2 chrony e2fsprogs 
     util-linux coreutils
 )
 # Commands that must exist. If one is missing after the package install, the
 # script asks the package database which package ships /usr/bin/<cmd>.
 REQUIRED_CMDS=(
-    curl ping lsblk blkid wipefs parted partprobe mkfs.fat mkfs.xfs
+    curl ping lsblk blkid wipefs parted partprobe mkfs.fat mkfs.ext4
     pvcreate vgcreate lvcreate lvs vgs pvs vgchange vgremove
     numfmt basestrap artix-chroot pacman-key
 )
@@ -301,8 +301,8 @@ lvcreate -y -l 100%FREE -n home "$VG"
 
 mkswap -L swap "/dev/$VG/swap"
 mkfs.fat -F32 -n BOOT "$BOOT_P"
-mkfs.xfs -f -L SG_ROOT "/dev/$VG/root"                          # XFS labels max 12 chars
-mkfs.xfs -f -L SG_HOME "/dev/$VG/home"
+mkfs.ext4 -F -L SG_ROOT "/dev/$VG/root"
+mkfs.ext4 -F -L SG_HOME "/dev/$VG/home"
 udevadm settle
 
 mount -o noatime "/dev/$VG/root" /mnt
@@ -327,8 +327,8 @@ say "Writing fstab..."
 # Device-mapper paths for root/home.
 ESP_UUID=$(blkid -s UUID -o value "$BOOT_P")
 cat > /mnt/etc/fstab <<EOF
-/dev/mapper/${VG}-root   /      xfs    rw,noatime                        0 0
-/dev/mapper/${VG}-home   /home  xfs    rw,noatime                        0 0
+/dev/mapper/${VG}-root   /      ext4    rw,noatime                        0 0
+/dev/mapper/${VG}-home   /home  ext4    rw,noatime                        0 0
 UUID=${ESP_UUID}         /boot  vfat   rw,noatime,fmask=0077,dmask=0077  0 2
 /dev/mapper/${VG}-swap   none   swap   defaults                          0 0
 EOF
@@ -497,7 +497,7 @@ chr mkinitcpio -P
 say "Installing Limine..."
 mkdir -p /mnt/boot/EFI/BOOT
 cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/EFI/BOOT/BOOTX64.EFI
-CMDLINE="root=/dev/mapper/${VG}-root rootfstype=xfs rw loglevel=3 split_lock_detect=off zswap.enabled=0 transparent_hugepage=madvise"
+CMDLINE="root=/dev/mapper/${VG}-root rootfstype=ext4 rw loglevel=3 split_lock_detect=off zswap.enabled=0 transparent_hugepage=madvise"
 cat > /mnt/boot/EFI/BOOT/limine.conf <<EOF
 timeout: 5
 remember_last_entry: yes
