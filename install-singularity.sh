@@ -4,7 +4,7 @@
 # -----------------------------------------------------------------------------
 #  Boot an Artix *dinit* live ISO in UEFI mode (Secure Boot OFF), then run this
 #  as root.  Result:
-#    Artix repos + dinit + elogind     doas (no sudo)       XFS on LVM thin pool
+#    Artix repos + dinit + elogind     doas (no sudo)       XFS on plain LVM
 #    Limine on the ESP (= /boot)       zram + swap LV       no login manager
 #    AMD + Intel: both microcodes, Vulkan driver(s) picked by hardware detection
 # =============================================================================
@@ -13,9 +13,8 @@ set -eE -o pipefail
 # ------------------------------- settings ------------------------------------
 VG="singularity"      # LVM volume group name
 ESP_MIB=1024          # FAT32 ESP, mounted at /boot (Limine can't read XFS)
-SWAP_SIZE="8G"        # linear swap LV, deliberately OUTSIDE the thin pool
-ROOT_SIZE="120G"      # virtual size of the thin root LV (capped to pool size)
-SNAP_KEEP=8           # automatic pre-pacman snapshots to keep
+SWAP_SIZE="8G"        # swap LV
+ROOT_SIZE="120G"      # root LV size
 TIMEZONE="Asia/Kolkata"
 LOCALE="en_US.UTF-8"
 USE_CACHYOS=1         # 1 = CachyOS repo (listed LAST) + linux-cachyos-bore, 0 = Artix linux-zen
@@ -46,7 +45,7 @@ echo ""
 # Packages the live session needs before any disk work. Installed up front.
 LIVE_PKGS=(
     artix-keyring curl iputils parted dosfstools xfsprogs lvm2
-    thin-provisioning-tools util-linux coreutils
+    util-linux coreutils
 )
 # Commands that must exist. If one is missing after the package install, the
 # script asks the package database which package ships /usr/bin/<cmd>.
@@ -112,7 +111,6 @@ pacman-key --init
 pacman-key --populate artix
 install_live_deps
 pacman-key --populate artix
-modprobe dm-thin-pool || true
 
 if [[ $USE_CACHYOS == 1 ]]; then
     say "Importing CachyOS signing key..."
@@ -225,7 +223,7 @@ PKGS=(
     base dinit elogind-dinit dbus dbus-dinit artix-keyring artix-mirrorlist
     "$KERNEL" "${KERNEL}-headers" linux-firmware mkinitcpio lz4
     amd-ucode intel-ucode
-    lvm2 thin-provisioning-tools xfsprogs dosfstools efibootmgr limine
+    lvm2 xfsprogs dosfstools efibootmgr limine
     opendoas
     networkmanager networkmanager-dinit
     zramen zramen-dinit
@@ -274,7 +272,7 @@ if [[ $DRIVE == *nvme* || $DRIVE == *mmcblk* ]]; then P="p"; else P=""; fi
 BOOT_P="${DRIVE}${P}1"
 PV_P="${DRIVE}${P}2"
 
-# ------------------------- partition + LVM thin + XFS ------------------------
+# ------------------------- partition + LVM + XFS -----------------------------
 say "Partitioning $DRIVE..."
 if vgs --noheadings "$VG" &>/dev/null; then
     if pvs --noheadings -o pv_name -S "vg_name=$VG" | grep -qv "^ *${DRIVE}"; then
@@ -293,16 +291,11 @@ udevadm settle
 sleep 2
 wipefs -af "$BOOT_P" "$PV_P"
 
-say "Creating LVM: swap LV + thin pool (root, home)..."
-pvcreate -ff -y "$PV_P"
-vgcreate -y "$VG" "$PV_P"
-lvcreate -y -L "$SWAP_SIZE" -n swap "$VG"                      # linear, NOT thin
-lvcreate -y --type thin-pool -l 90%FREE -n pool "$VG"          # ~10% of the VG stays free for pool growth
-POOL_B=$(lvs --noheadings --nosuffix --units b -o lv_size "$VG/pool" | tr -d ' ')
-ROOT_B=$(numfmt --from=iec "$ROOT_SIZE")
-if (( ROOT_B > POOL_B )); then ROOT_B=$POOL_B; fi
-lvcreate -y -V "${ROOT_B}b" -T "$VG/pool" -n root
-lvcreate -y -V "${POOL_B}b" -T "$VG/pool" -n home              # home is NOT rolled back with root
+say "Creating LVM logical volumes (swap, root, home)..."
+lvcreate -y -L "$SWAP_SIZE" -n swap "$VG"
+lvcreate -y -L "$ROOT_SIZE" -n root "$VG"
+# home takes the rest of the VG
+lvcreate -y -l 100%FREE -n home "$VG"
 udevadm settle
 
 mkswap -L swap "/dev/$VG/swap"
@@ -320,7 +313,6 @@ swapon "/dev/$VG/swap"
 # initramfs config goes in BEFORE the kernel is installed, so the first build is already LVM-aware
 mkdir -p /mnt/etc/mkinitcpio.conf.d
 cat > /mnt/etc/mkinitcpio.conf.d/singularity.conf <<'EOF'
-MODULES=(dm-thin-pool)
 HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block lvm2 filesystems)
 COMPRESSION="lz4"
 EOF
@@ -331,7 +323,7 @@ basestrap /mnt "${PKGS[@]}"
 install -m644 /etc/pacman.conf /mnt/etc/pacman.conf
 
 say "Writing fstab..."
-# Device paths, not UUIDs for root/home: a thin snapshot of an XFS volume carries the SAME UUID.
+# Device-mapper paths for root/home.
 ESP_UUID=$(blkid -s UUID -o value "$BOOT_P")
 cat > /mnt/etc/fstab <<EOF
 /dev/mapper/${VG}-root   /      xfs    rw,noatime                        0 0
@@ -363,10 +355,6 @@ vm.max_map_count = 2147483642
 vm.vfs_cache_pressure = 100
 EOF
 
-# Thin pool must auto-extend before it fills (needs dmeventd monitoring, see notes)
-sed -i 's/^\([[:space:]]*\)thin_pool_autoextend_threshold = 100/\1thin_pool_autoextend_threshold = 80/' /mnt/etc/lvm/lvm.conf
-grep -q 'thin_pool_autoextend_threshold = 80' /mnt/etc/lvm/lvm.conf \
-    || warn "Set activation/thin_pool_autoextend_threshold = 80 in /etc/lvm/lvm.conf by hand."
 
 # ------------------------------ doas / makepkg / paru ------------------------
 say "Configuring doas (no sudo)..."
@@ -429,46 +417,7 @@ EOF
 chmod +x "$UH/post-install.sh"
 chr chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER"
 
-# --------------------------- snapshots (LVM thin) ----------------------------
-say "Installing snapshot helper + pacman hooks..."
-mkdir -p /mnt/usr/local/bin /mnt/etc/pacman.d/hooks
-{
-    echo '#!/bin/sh'
-    echo "VG=\"$VG\""
-    echo "KEEP=$SNAP_KEEP"
-    cat <<'EOF'
-set -e
-case "${1:-help}" in
-  create)     name="root_${2:-manual}_$(date +%Y%m%d-%H%M%S)"
-              lvcreate -s -n "$name" "$VG/root"; echo "created $name" ;;
-  pre-pacman) lvcreate -s -n "root_pre_$(date +%Y%m%d-%H%M%S)" "$VG/root" >/dev/null
-              lvs --noheadings -o lv_name --sort lv_time "$VG" | tr -d ' ' | grep '^root_pre_' \
-                | head -n "-$KEEP" | while read -r old; do lvremove -y "$VG/$old" >/dev/null; done || true ;;
-  list)       lvs -o lv_name,lv_size,data_percent,lv_time,origin "$VG" ;;
-  remove)     lvremove "$VG/$2" ;;
-  mount)      mkdir -p /mnt/snap; lvchange -ay -K "$VG/$2"; mount -o ro,nouuid "/dev/$VG/$2" /mnt/snap ;;
-  rollback)   lvconvert --mergethin "$VG/$2"
-              echo "Merge completes when root is next activated (reboot)."
-              echo "NOTE: kernel/initramfs on the ESP are NOT rolled back - reinstall the kernel package afterwards." ;;
-  *)          echo "usage: lvsnap create [tag] | list | remove <lv> | mount <lv> | rollback <lv>" ;;
-esac
-EOF
-} > /mnt/usr/local/bin/lvsnap
-chmod 755 /mnt/usr/local/bin/lvsnap
-
-cat > /mnt/etc/pacman.d/hooks/00-lvm-snapshot.hook <<'EOF'
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Operation = Remove
-Type = Package
-Target = *
-
-[Action]
-Description = Snapshotting root (LVM thin)...
-When = PreTransaction
-Exec = /usr/local/bin/lvsnap pre-pacman
-EOF
+mkdir -p /mnt/etc/pacman.d/hooks
 
 cat > /mnt/etc/pacman.d/hooks/99-limine.hook <<'EOF'
 [Trigger]
