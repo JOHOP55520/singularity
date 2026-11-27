@@ -44,7 +44,7 @@ echo ""
 # ------------------------------- live dependencies ---------------------------
 # Packages the live session needs before any disk work. Installed up front.
 LIVE_PKGS=(
-    artix-keyring curl iputils parted dosfstools xfsprogs lvm2
+    artix-keyring curl iputils parted dosfstools xfsprogs lvm2 chrony
     util-linux coreutils
 )
 # Commands that must exist. If one is missing after the package install, the
@@ -235,7 +235,7 @@ PKGS=(
 if [[ $USE_CACHYOS == 1 ]]; then PKGS+=(cachyos-keyring); fi
 
 # nice-to-have packages: installed one by one, skipped if missing
-OPT_PKGS=(bluez bluez-utils bluez-dinit ntp ntp-dinit irqbalance irqbalance-dinit
+OPT_PKGS=(bluez bluez-utils bluez-dinit chrony chrony-dinit irqbalance irqbalance-dinit
           ananicy-cpp ananicy-cpp-dinit device-mapper-dinit lvm2-dinit)
 
 say "Pre-flight: checking that every package exists BEFORE touching the disk..."
@@ -291,12 +291,13 @@ udevadm settle
 sleep 2
 wipefs -af "$BOOT_P" "$PV_P"
 
-say "Creating LVM logical volumes (swap, root, home)..."
+
+say "Creating LVM physical volume, volume group and logical volumes..."
+pvcreate -ff -y "$PV_P"
+vgcreate -y "$VG" "$PV_P"
 lvcreate -y -L "$SWAP_SIZE" -n swap "$VG"
 lvcreate -y -L "$ROOT_SIZE" -n root "$VG"
-# home takes the rest of the VG
 lvcreate -y -l 100%FREE -n home "$VG"
-udevadm settle
 
 mkswap -L swap "/dev/$VG/swap"
 mkfs.fat -F32 -n BOOT "$BOOT_P"
