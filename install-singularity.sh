@@ -296,7 +296,7 @@ say "Creating LVM physical volume, volume group and logical volumes..."
 pvcreate -ff -y "$PV_P"
 vgcreate -y "$VG" "$PV_P"
 lvcreate -y -L "$SWAP_SIZE" -n swap "$VG"
-lvcreate -y -L "$ROOT_SIZE" -n root "$VG"
+lvcreate -y -l 60%FREE -n root "$VG"
 lvcreate -y -l 100%FREE -n home "$VG"
 
 mkswap -L swap "/dev/$VG/swap"
